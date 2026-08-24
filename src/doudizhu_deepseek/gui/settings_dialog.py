@@ -1,9 +1,8 @@
-"""Settings dialog: difficulty and optional DeepSeek API configuration."""
+"""Settings dialog: difficulty and DeepSeek API configuration."""
 
-from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QLineEdit, QComboBox, QLabel, QPushButton,
-                             QGroupBox, QCheckBox, QMessageBox)
+                             QGroupBox, QMessageBox)
 
 from .. import settings
 
@@ -25,19 +24,17 @@ class SettingsDialog(QDialog):
         diff_box = QGroupBox("AI 难度")
         diff_lay = QVBoxLayout(diff_box)
         self.diff_combo = QComboBox()
-        for key, label in [("easy", "简单"), ("medium", "中等"), ("hard", "困难")]:
+        for key, label in [("easy", "简单"), ("medium", "中等"),
+                           ("hard", "困难"), ("ai", "AI（大模型）")]:
             self.diff_combo.addItem(label, key)
         idx = self.diff_combo.findData(self.config.get("difficulty", "medium"))
         self.diff_combo.setCurrentIndex(max(0, idx))
         diff_lay.addWidget(self.diff_combo)
         root.addWidget(diff_box)
 
-        # LLM API (OpenAI-compatible, drives the hard AI)
-        ds_box = QGroupBox("AI 大模型（可选，困难级 AI）")
+        # LLM API (OpenAI-compatible, used only by the standalone AI level)
+        ds_box = QGroupBox("AI 大模型配置")
         ds_lay = QVBoxLayout(ds_box)
-        self.enabled = QCheckBox("启用大模型驱动困难级 AI")
-        self.enabled.setChecked(str(self.config.get("ai_enabled", "false")).lower() == "true")
-        ds_lay.addWidget(self.enabled)
 
         form = QFormLayout()
         self.key_edit = QLineEdit(self.config.get("api_key", "apikey"))
@@ -50,7 +47,7 @@ class SettingsDialog(QDialog):
         form.addRow("Base URL：", self.base_edit)
         form.addRow("模型：", self.model_edit)
         ds_lay.addLayout(form)
-        tip = QLabel("OpenAI 兼容接口；离线、无 Key 或返回非法牌时自动回退到内置困难 AI。")
+        tip = QLabel("仅“AI（大模型）”难度使用此接口；连接或决策失败时暂停对局并报错，不使用本地策略。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#777; font-size:11px;")
         ds_lay.addWidget(tip)
@@ -70,10 +67,8 @@ class SettingsDialog(QDialog):
         root.addLayout(buttons)
 
     def _test(self):
-        from ..deepseek_ai import ask_deepseek, DeepSeekUnavailable
-        from ..game import make_deck
+        from ..deepseek_ai import DeepSeekUnavailable
         tmp_cfg = {
-            "ai_enabled": "true",
             "api_key": self.key_edit.text().strip(),
             "base_url": self.base_edit.text().strip(),
             "model": self.model_edit.text().strip(),
@@ -85,11 +80,8 @@ class SettingsDialog(QDialog):
         self.test_btn.setText("连接中…")
         try:
             # minimal probe: just validate reachability/view via a tiny call
-            probe = {
-                "ai_enabled": "true", "api_key": tmp_cfg["api_key"],
-                "base_url": tmp_cfg["base_url"], "model": tmp_cfg["model"]}
             from ..deepseek_ai import _probe
-            _probe(probe, timeout=10)
+            _probe(tmp_cfg, timeout=10)
             QMessageBox.information(self, "测试连接", "连接成功")
         except DeepSeekUnavailable as e:
             QMessageBox.warning(self, "测试连接", f"连接失败：{e}")
@@ -101,7 +93,6 @@ class SettingsDialog(QDialog):
 
     def _save_and_close(self):
         self.config["difficulty"] = self.diff_combo.currentData()
-        self.config["ai_enabled"] = "true" if self.enabled.isChecked() else "false"
         self.config["api_key"] = self.key_edit.text().strip()
         self.config["base_url"] = self.base_edit.text().strip()
         self.config["model"] = self.model_edit.text().strip()

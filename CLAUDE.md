@@ -4,20 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 概述
 
-Windows 单机斗地主（Python + PyQt5），一名玩家对战两名 AI。支持 简单/中等/困难 三级 AI，「困难」级可选接入 DeepSeek 大模型（OpenAI 兼容 `/chat/completions`）。
+Windows 单机斗地主（Python + PyQt5），一名玩家对战两名 AI。支持简单/中等/困难三档本地策略，以及独立的 AI（大模型）难度（OpenAI 兼容 `/chat/completions`）。
 
-核心设计：**游戏引擎与 GUI 完全分离**。`doudizhu/game.py` 是纯逻辑、不依赖 Qt，因此可被无头测试和 AI 复用；`doudizhu/gui/` 仅负责界面与回合调度。
+核心设计：**游戏引擎与 GUI 完全分离**。`src/doudizhu_deepseek/game.py` 是纯逻辑、不依赖 Qt，因此可被无头测试和 AI 复用；`src/doudizhu_deepseek/gui/` 仅负责界面与回合调度。
 
 ## 运行与测试
 
 ```bash
-pip install -r requirements.txt   # PyQt5>=5.15, requests>=2.25
-python main.py                    # 启动游戏（需要图形环境）
-python smoke_test.py              # 引擎 + AI + 设置 + DeepSeek 回退，无 GUI，退出码非 0 即失败
+uv sync                           # 创建 .venv 并同步锁定依赖
+uv run python main.py             # 启动游戏（需要图形环境）
+uv run python smoke_test.py       # 引擎 + AI + 设置 + 模型严格校验，无 GUI，退出码非 0 即失败
 ```
 
 - 无单独 lint/类型检查配置；`smoke_test.py` 是唯一的自动测试入口。
-- DeepSeek 相关测试在离线下运行（`smoke_test.py` 通过 `timeout=2` 触发回退路径），无需连网。
+- DeepSeek 相关测试使用模拟响应，无需联网，并验证不可用时抛错且不回退。
 - Windows 打包：`build_exe.bat`（PyInstaller，产物 `dist/DouDiZhu.exe`）。
 
 ## 架构
@@ -31,16 +31,16 @@ python smoke_test.py              # 引擎 + AI + 设置 + DeepSeek 回退，无
   - **回合流转要点**：没人出牌时可 `lead` 任意牌型；`pass_count >= 2` 时由 `last_leader` 重新 `lead`。
 - `ai.py` — `CardAI`，按难度 `easy/medium/hard` 区分策略；`decide()` 根据 `game.last_play is None`/可否 lead 分流到 `_decide_lead` / `_decide_follow`；hard 含队友默契（农民让牌）。
 
-### DeepSeek 集成（安全回退）
-- `deepseek_ai.py` — `hard_decide(game, hand, player_idx, cfg, heuristic_ai)` 是唯一入口：**模型输出从不被信任**。
-  - 模型仅返回 JSON `{"play": [...], "reason": "..."}`；`_resolve_request` 把点数记号映射回**手牌中真实存在的牌**，`parse_play` 校验牌型，再校验必须压过桌面（除非可 lead）。任何非法/超时/断网/未配置都 `raise DeepSeekUnavailable`，`hard_decide` 捕获后退回内置 heuristic AI——**游戏绝不停摆或作弊**。
-  - 修改 prompt/校验逻辑时，必须保留这条「先严格校验、失败必回退」的约束（`smoke_test.py` 有回归覆盖）。
+### DeepSeek 集成（严格失败）
+- `deepseek_ai.py` — `ai_decide(game, hand, player_idx, cfg)` 是独立 AI 难度的入口：**模型输出从不被信任，也不回退本地策略**。
+  - 模型仅返回 JSON `{"play": [...], "reason": "..."}`；`_resolve_request` 把点数记号映射回**手牌中真实存在的牌**，`parse_play` 校验牌型，再校验必须压过桌面（除非可 lead）。非法、超时、断网或未配置都抛出 `DeepSeekUnavailable`，GUI 暂停当前回合并报错。
+  - 修改 prompt/校验逻辑时，必须保留“严格校验，失败显式报错，禁止本地回退”的约束（`smoke_test.py` 有回归覆盖）。
 
 ### 配置
-- `settings.py` — 配置持久化到用户级 `~/.doudizhu/config.ini`（不用仓库内文件，便于 PyInstaller 单文件 exe）。`load_config()` 返回默认值合并后的 dict；`save_config()` 覆盖写入。字段含 `difficulty`、`ai_enabled`、`api_key`、`base_url`、`model`、`player_name`（见 `config.example.ini`）；LLM 部分是 OpenAI 兼容接口，默认指向本地 `http://192.168.76.43:8888/v1`、模型 `deepseek-v4-flash`。
+- `settings.py` — 配置持久化到用户级 `~/.doudizhu/config.ini`（不用仓库内文件，便于 PyInstaller 单文件 exe）。`load_config()` 返回默认值合并后的 dict；字段含 `difficulty`、`api_key`、`base_url`、`model`、`player_name`（见 `config.example.ini`）。
 
 ### GUI 层（PyQt5）
-- `gui/main_window.py` — `MainWindow`：布局、回合调度。AI 回合用 `QTimer`（900ms）驱动 `_ai_step`，人类回合停表等输入；难度通过 `_set_diff_and_ais` 决定每名 AI 的 `CardAI`；当 `difficulty==hard && deepseek_enabled` 时走 `hard_decide`。
+- `gui/main_window.py` — `MainWindow`：布局、回合调度。AI 回合用 `QTimer`（900ms）驱动 `_ai_step`；简单/中等/困难使用 `CardAI`，`difficulty==ai` 时在线程中调用 `ai_decide`，失败则暂停并弹窗。
 - `gui/card_widget.py` — 手牌区组件与选牌/重排。
 - `gui/card_counter.py` — 记牌器（`INITIAL`：普通牌每张 4 张、大小王各 1）。
 - `gui/settings_dialog.py` — 设置对话框（难度 + DeepSeek 配置 + 测试连接）。

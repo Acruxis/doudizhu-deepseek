@@ -5,14 +5,14 @@ from collections import Counter
 
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QLabel, QPushButton, QFrame)
+                             QLabel, QPushButton, QFrame, QMessageBox)
 
 from ..game import (DouDiZhuGame, GAME_IDLE, GAME_BIDDING, GAME_GRAB, GAME_PLAY,
                     GAME_OVER, BOMB, ROCKET, parse_play, rank_name,
                     PLAY_TYPE_CN, format_cards)
 from ..ai import CardAI
 from .. import settings
-from ..deepseek_ai import hard_decide
+from ..deepseek_ai import ai_decide
 from .card_widget import HandWidget
 from .card_counter import CardCounter, INITIAL
 from .settings_dialog import SettingsDialog
@@ -20,7 +20,7 @@ from .replay_dialog import ReplayDialog, HistoryDialog
 
 PLAYER_NAMES = ["你", "小北", "小美"]   # [0]=你, [1]=下家, [2]=上家
 
-DIFF_CN = {"easy": "简单", "medium": "中等", "hard": "困难"}
+DIFF_CN = {"easy": "简单", "medium": "中等", "hard": "困难", "ai": "AI（大模型）"}
 
 
 def player_role(game, idx):
@@ -31,11 +31,11 @@ _ASYNC = object()   # sentinel: a background (network) decision is in flight
 
 
 class _MoveWorker(QThread):
-    """Runs a possibly network-bound decision (Hard AI + DeepSeek) off the GUI
+    """Runs a network-bound model decision off the GUI
     thread and reports the resulting Play (or None = pass) back to the main
     thread. This keeps the window responsive even when the endpoint is slow or
     unreachable, instead of freezing on a synchronous request."""
-    done = pyqtSignal(int, object)   # (player_idx, play | None)
+    done = pyqtSignal(int, object, object)  # (player_idx, play | None, error | None)
 
     def __init__(self, player_idx, fn, parent=None):
         super().__init__(parent)
@@ -45,9 +45,11 @@ class _MoveWorker(QThread):
     def run(self):
         try:
             result = self.fn()
-        except Exception:
+            error = None
+        except Exception as exc:
             result = None
-        self.done.emit(self.player_idx, result)
+            error = str(exc) or exc.__class__.__name__
+        self.done.emit(self.player_idx, result, error)
 
 
 class PlayerPanel(QFrame):
@@ -105,13 +107,12 @@ def recent_text(recent):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("斗地主 · 三级难度")
+        self.setWindowTitle("斗地主 · 四档难度")
         self.resize(1200, 800)
         self.config = settings.load_config()
         self.game = DouDiZhuGame()
         self.ais = [CardAI("hard"), CardAI("hard"), CardAI("hard")]
         self._diff = "medium"
-        self.ai_on = str(self.config.get("ai_enabled", "false")).lower() == "true"
         # per-player last action: tuple (kind, info) with info = Play | None
         self.recent = [("none", None), ("none", None), ("none", None)]
         self.history = []              # 出牌历史: list of (player_idx, Play | None)
@@ -277,9 +278,10 @@ class MainWindow(QMainWindow):
     def _set_diff_and_ais(self):
         diff = self.config.get("difficulty", "medium")
         self._diff = diff
-        self.ais[1] = CardAI(diff)
-        self.ais[2] = CardAI(diff)
-        self.ais[0] = CardAI("hard" if diff == "hard" else "medium")
+        local_diff = "hard" if diff == "ai" else diff
+        self.ais[1] = CardAI(local_diff)
+        self.ais[2] = CardAI(local_diff)
+        self.ais[0] = CardAI("hard" if local_diff == "hard" else "medium")
 
     def new_game(self):
         self._game_serial += 1          # 作废任何仍在途的异步决策
@@ -490,24 +492,21 @@ class MainWindow(QMainWindow):
         self._apply_ai_result(p, play)
 
     def _ai_turn(self, g, p):
-        """Decide for an AI player. Only the network-bound Hard decision is
-        offloaded to a worker thread; the local heuristic AIs are cheap and
-        run inline."""
+        """Use the model only for the standalone AI difficulty."""
         hand = g.hands[p]
-        if self._diff == "hard" and self.ai_on:
-            return self._spawn_decision(p, lambda: hard_decide(g, hand, p,
-                                                               self.config, self.ais[p]))
+        if self._diff == "ai":
+            return self._spawn_decision(
+                p, lambda: ai_decide(g, hand, p, self.config))
         return self.ais[p].decide(g, hand, p)
 
     def _auto_turn(self, g):
         """Decide for the human under 托管 — always the highest-difficulty bot
-        (uses DeepSeek too when it's enabled), so it plays stronger than the
-        in-game AIs."""
+        or the model when the standalone AI difficulty is selected."""
         p = 0
         hand = g.hands[0]
-        if self.ai_on:
-            return self._spawn_decision(p, lambda: hard_decide(g, hand, p,
-                                                               self.config, self.auto_bot))
+        if self._diff == "ai":
+            return self._spawn_decision(
+                p, lambda: ai_decide(g, hand, p, self.config))
         return self.auto_bot.decide(g, hand, 0)
 
     def _spawn_decision(self, p, fn):
@@ -515,15 +514,26 @@ class MainWindow(QMainWindow):
         is applied later on the GUI thread by _async_done."""
         w = _MoveWorker(p, fn)
         serial = self._game_serial
-        w.done.connect(lambda idx, pl, s=serial: self._async_done(idx, pl, s))
+        w.done.connect(
+            lambda idx, pl, err, s=serial: self._async_done(idx, pl, err, s))
         w.finished.connect(lambda ww=w: (self._workers.discard(ww), ww.deleteLater()))
         self._workers.add(w)
         w.start()
         return _ASYNC
 
-    def _async_done(self, p, play, serial):
+    def _async_done(self, p, play, error, serial):
         if serial != self._game_serial:
             return                       # 已在后台决策期间开了新对局，丢弃
+        if error:
+            self._ai_timer.stop()
+            self._update_status(f"AI 调用失败：{error}")
+            QMessageBox.critical(
+                self,
+                "AI 调用失败",
+                f"大模型无法完成本次决策：\n{error}\n\n"
+                "当前对局已暂停，不会改用本地人机策略。请检查设置后重试或开始新一局。",
+            )
+            return
         self._apply_ai_result(p, play)
 
     def _apply_ai_result(self, p, play):
@@ -811,6 +821,6 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self, self.config)
         if dlg.exec_():
             self.config = dlg.config
-            self.ai_on = str(self.config.get("ai_enabled", "false")).lower() == "true"
             self._set_diff_and_ais()
             self._refresh()
+            self._schedule_next()

@@ -5,12 +5,14 @@ Exits non-zero if anything fails.
 """
 import random
 import sys
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from doudizhu.game import (Card, parse_play, Play, get_valid_plays,
-                           DouDiZhuGame, _is_run)
-from doudizhu.ai import CardAI
-from doudizhu import settings
-import doudizhu.deepseek_ai as ds
+from doudizhu_deepseek.game import (Card, parse_play, Play, get_valid_plays,
+                                    DouDiZhuGame, _is_run, rank_name)
+from doudizhu_deepseek.ai import CardAI
+from doudizhu_deepseek import settings
+import doudizhu_deepseek.deepseek_ai as ds
 
 
 def mk(ranks):
@@ -150,23 +152,55 @@ def main():
               rc.get("deadlock", 0) == 0 and rc.get("rule-error", 0) == 0)
 
     # --- settings roundtrip ---
-    cfg = {"difficulty": "hard", "api_key": "sk-x",
-           "ai_enabled": "true"}
-    settings.save_config(cfg)
-    loaded = settings.load_config()
-    check("settings roundtrip", loaded["difficulty"] == "hard")
+    cfg = {"difficulty": "ai", "api_key": "sk-x"}
+    with TemporaryDirectory() as cfg_dir, \
+            patch.object(settings, "_config_dir", return_value=cfg_dir):
+        settings.save_config(cfg)
+        loaded = settings.load_config()
+    check("settings roundtrip", loaded["difficulty"] == "ai")
     check("settings roundtrip key defaults", loaded["base_url"] == "http://192.168.76.43:8888/v1"
           and loaded["model"] == "deepseek-v4-flash" and loaded["api_key"] == "sk-x")
 
-    # --- LLM fallback (no network) ---
+    # --- model-backed difficulty: strict validation and no local fallback ---
     g = DouDiZhuGame()
     g.start_new_game()
     g.phase = "play"
-    ai = CardAI("hard")
-    offline = {"ai_enabled": "false", "api_key": "",
-               "base_url": "x", "model": "x"}
-    res = ds.hard_decide(g, g.hands[0], 0, offline, ai, timeout=2)
-    check("deepseek offline -> heuristic decision", res is not None)
+    g.current_player = 0
+    offline = {"api_key": "", "base_url": "x", "model": "x"}
+    try:
+        ds.ai_decide(g, g.hands[0], 0, offline, timeout=2)
+        no_fallback = False
+    except ds.DeepSeekUnavailable:
+        no_fallback = True
+    check("AI unavailable raises instead of local fallback", no_fallback)
+
+    class FakeResponse:
+        def __init__(self, content):
+            self.content = content
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": self.content}}]}
+
+    api_cfg = {"api_key": "sk-test", "base_url": "https://example.test/v1",
+               "model": "test-model"}
+    token = rank_name(g.hands[0][0].rank)
+    valid_response = FakeResponse('{"play": ["' + token + '"], "reason": "test"}')
+    with patch.object(ds.requests, "post", return_value=valid_response):
+        model_play = ds.ai_decide(g, g.hands[0], 0, api_cfg)
+    check("AI valid response is accepted", model_play is not None and
+          len(model_play.cards) == 1 and model_play.cards[0].rank == g.hands[0][0].rank)
+
+    invalid_pass = FakeResponse('{"play": null, "reason": "test"}')
+    with patch.object(ds.requests, "post", return_value=invalid_pass):
+        try:
+            ds.ai_decide(g, g.hands[0], 0, api_cfg)
+            rejected_pass = False
+        except ds.DeepSeekUnavailable:
+            rejected_pass = True
+    check("AI cannot pass while leading", rejected_pass)
 
     print(f"\nPASS={PASS}  FAIL={FAIL}")
     return 1 if FAIL else 0

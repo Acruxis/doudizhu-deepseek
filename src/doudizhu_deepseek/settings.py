@@ -1,6 +1,6 @@
 """Application settings persisted to a user-level INI file.
 
-Stores the selected AI difficulty, and (optional) DeepSeek API credentials.
+Stores the selected difficulty and DeepSeek API credentials.
 Config lives at `~/.doudizhu/config.ini` so it survives across runs and works
 with a PyInstaller single-file exe (no bundled files needed).
 """
@@ -10,8 +10,7 @@ import os
 APP_NAME = "doudizhu"
 
 _DEFAULT = {
-    "difficulty": "medium",        # easy / medium / hard
-    "ai_enabled": "false",         # use an LLM to back the hard AI
+    "difficulty": "medium",        # easy / medium / hard / ai
     "api_key": "apikey",           # any OpenAI-compatible API key
     "base_url": "http://192.168.76.43:8888/v1",   # OpenAI-compatible endpoint
     "model": "deepseek-v4-flash",

@@ -1,9 +1,9 @@
-"""Opponent AI with three difficulty levels: Easy, Medium, Hard.
+"""Local opponent AI with three difficulty levels: Easy, Medium, Hard.
 
 Easy plays near-random legal options. Medium prefers clearing combinations and
 saving big cards. Hard uses scoring heuristics plus partner cooperation. The
-Hard level may also be backed by a DeepSeek API call (see deepseek_ai.py); when
-that's disabled or fails it falls back to the strong heuristic strategy here.
+separate model-backed difficulty is implemented in deepseek_ai.py and never
+falls back to these local strategies.
 """
 import random
 

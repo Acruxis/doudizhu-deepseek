@@ -15,7 +15,7 @@ pushd "%~dp0" >nul 2>&1 || (
 REM --- Install dependencies (optional; skip if already installed) ---
 REM Always call via `python -m`, so it works even when the scripts folder is
 REM not on PATH (e.g. pip installed into the per-user site-packages).
-python -m pip install -r requirements.txt
+python -m pip install -e .
 python -m pip install pyinstaller
 
 REM --- Build the single-file GUI executable ---
