@@ -27,8 +27,10 @@ class SettingsDialog(QDialog):
         for key, label in [("easy", "简单"), ("medium", "中等"),
                            ("hard", "困难"), ("ai", "AI（大模型）")]:
             self.diff_combo.addItem(label, key)
-        idx = self.diff_combo.findData(self.config.get("difficulty", "medium"))
-        self.diff_combo.setCurrentIndex(max(0, idx))
+        idx = self.diff_combo.findData(self.config.get("difficulty", "hard"))
+        if idx < 0:
+            idx = self.diff_combo.findData("hard")
+        self.diff_combo.setCurrentIndex(idx)
         diff_lay.addWidget(self.diff_combo)
         root.addWidget(diff_box)
 
@@ -47,7 +49,7 @@ class SettingsDialog(QDialog):
         form.addRow("Base URL：", self.base_edit)
         form.addRow("模型：", self.model_edit)
         ds_lay.addLayout(form)
-        tip = QLabel("仅“AI（大模型）”难度使用此接口；连接或决策失败时暂停对局并报错，不使用本地策略。")
+        tip = QLabel("仅“AI（大模型）”难度使用此接口；策略格式或出牌非法时由困难策略接管并记录，连接失败时暂停报错。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#777; font-size:11px;")
         ds_lay.addWidget(tip)

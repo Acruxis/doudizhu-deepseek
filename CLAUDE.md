@@ -17,7 +17,7 @@ uv run python smoke_test.py       # 引擎 + AI + 设置 + 模型严格校验，
 ```
 
 - 无单独 lint/类型检查配置；`smoke_test.py` 是唯一的自动测试入口。
-- DeepSeek 相关测试使用模拟响应，无需联网，并验证不可用时抛错且不回退。
+- DeepSeek 相关测试使用模拟响应，无需联网，并验证策略错误时困难策略接管、联通错误时抛错暂停。
 - Windows 打包：`build_exe.bat`（PyInstaller，产物 `dist/DouDiZhu.exe`）。
 
 ## 架构
@@ -32,15 +32,16 @@ uv run python smoke_test.py       # 引擎 + AI + 设置 + 模型严格校验，
 - `ai.py` — `CardAI`，按难度 `easy/medium/hard` 区分策略；`decide()` 根据 `game.last_play is None`/可否 lead 分流到 `_decide_lead` / `_decide_follow`；hard 含队友默契（农民让牌）。
 
 ### DeepSeek 集成（严格失败）
-- `deepseek_ai.py` — `ai_decide(game, hand, player_idx, cfg)` 是独立 AI 难度的入口：**模型输出从不被信任，也不回退本地策略**。
-  - 模型仅返回 JSON `{"play": [...], "reason": "..."}`；`_resolve_request` 把点数记号映射回**手牌中真实存在的牌**，`parse_play` 校验牌型，再校验必须压过桌面（除非可 lead）。非法、超时、断网或未配置都抛出 `DeepSeekUnavailable`，GUI 暂停当前回合并报错。
-  - 修改 prompt/校验逻辑时，必须保留“严格校验，失败显式报错，禁止本地回退”的约束（`smoke_test.py` 有回归覆盖）。
+- `deepseek_ai.py` — `ai_decide(game, hand, player_idx, cfg, history)` 是独立 AI 难度的严格入口；GUI 使用 `ai_decide_with_hard_fallback` 区分策略错误和联通错误。
+  - 模型仅返回 JSON `{"play": [...]}` 或 `{"play": null}`；`_resolve_request` 把点数记号映射回**手牌中真实存在的牌**，`parse_play` 校验牌型，再校验必须压过桌面（除非可 lead）。非法、超时、断网或未配置都抛出 `DeepSeekUnavailable`，GUI 暂停当前回合并报错。
+  - 每次调用是无状态快照：固定 system prompt + 当前手牌、公开底牌、各家余牌、已出/未出统计、完整出牌历史和桌面待压牌；不回传模型旧回复。
+  - 修改 prompt/校验逻辑时，必须保留“严格校验；仅 `DeepSeekDecisionError` 可由困难策略接管；联通/配置错误必须抛出”的约束（`smoke_test.py` 有回归覆盖）。
 
 ### 配置
-- `settings.py` — 配置持久化到用户级 `~/.doudizhu/config.ini`（不用仓库内文件，便于 PyInstaller 单文件 exe）。`load_config()` 返回默认值合并后的 dict；字段含 `difficulty`、`api_key`、`base_url`、`model`、`player_name`（见 `config.example.ini`）。
+- `settings.py` — 开发环境配置持久化到项目根目录 `config.ini`，PyInstaller 版本保存到 exe 同目录；该文件含 Key，必须保持 Git ignore。`load_config()` 返回默认值合并后的 dict；字段含 `difficulty`、`api_key`、`base_url`、`model`、`player_name`。
 
 ### GUI 层（PyQt5）
-- `gui/main_window.py` — `MainWindow`：布局、回合调度。AI 回合用 `QTimer`（900ms）驱动 `_ai_step`；简单/中等/困难使用 `CardAI`，`difficulty==ai` 时在线程中调用 `ai_decide`，失败则暂停并弹窗。
+- `gui/main_window.py` — `MainWindow`：布局、回合调度。AI 回合用 `QTimer`（900ms）驱动 `_ai_step`；`difficulty==ai` 时在线程中调用模型，策略错误由困难 AI 接管并计数/写历史，联通错误暂停弹窗。
 - `gui/card_widget.py` — 手牌区组件与选牌/重排。
 - `gui/card_counter.py` — 记牌器（`INITIAL`：普通牌每张 4 张、大小王各 1）。
 - `gui/settings_dialog.py` — 设置对话框（难度 + DeepSeek 配置 + 测试连接）。

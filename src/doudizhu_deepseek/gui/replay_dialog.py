@@ -36,6 +36,9 @@ class ReplayDialog(QDialog):
         super().__init__(parent)
         self.names = names              # ["你", 下家名, 上家名]
         self.rec = rec
+        self.failures_by_move = {
+            item.get("move"): item for item in rec.get("ai_failures", [])
+        }
         self.frames = replay_frames(rec["hands"], rec.get("landlord"),
                                     rec.get("bottom") or [], rec["moves"])
         self.step = 0                   # start at the opening deal
@@ -109,29 +112,40 @@ class ReplayDialog(QDialog):
         lr = self.rec.get("landlord")
         lr = lr if lr in (0, 1, 2) else None
         self.info_lbl.setText(f"第 {self.step + 1}/{n} 步 · 地主：{self.names[lr] if lr is not None else '—'}")
-        self.action_lbl.setText(
+        detail = (
             f"本步：{act}\n当前视角：{self.names[self.persp]} 的手牌"
-            f"{'（含底牌）' if self.persp == lr else ''}")
+            f"{'（含底牌）' if self.persp == lr else ''}"
+        )
+        failure = self.failures_by_move.get(self.step)
+        if failure:
+            detail += (
+                f"\n⚠ AI 模型策略失败：{failure.get('reason', '未知原因')}；"
+                f"困难策略接管：{failure.get('fallback', '—')}"
+            )
+        self.action_lbl.setText(detail)
         self.btn_prev.setEnabled(self.step > 0)
         self.btn_next.setEnabled(self.step < n - 1)
 
 
 def _game_label(names, rec):
     lr = rec.get("landlord", -1)
+    failures = len(rec.get("ai_failures", []))
+    failure_text = f" · 模型失败 {failures} 次" if failures else ""
     return (f"{len(rec['moves'])} 手 · 地主："
-            f"{names[lr] if lr in (0, 1, 2) else '—'}")
+            f"{names[lr] if lr in (0, 1, 2) else '—'}{failure_text}")
 
 
 class HistoryDialog(QDialog):
     """A single 历史回放 button: pick among the in-progress game and the last
     3 archived games, read every play, and 回放 any archived game."""
 
-    def __init__(self, names, current_moves, current_bidflow, saved_games,
-                 parent=None):
+    def __init__(self, names, current_moves, current_bidflow,
+                 current_ai_failures, saved_games, parent=None):
         super().__init__(parent)
         self.names = names
         self.current_moves = current_moves
         self.current_bidflow = current_bidflow
+        self.current_ai_failures = current_ai_failures
         self.saved_games = saved_games
         self._replay_index = -1
         # entries: (kind, index) — kind "current" or "arch"
@@ -187,11 +201,13 @@ class HistoryDialog(QDialog):
         if kind == "current":
             moves = self.current_moves
             bidflow = self.current_bidflow
+            ai_failures = self.current_ai_failures
             self.btn_replay.setEnabled(False)
         else:
             rec = self.saved_games[idx]
             moves = rec["moves"]
             bidflow = rec.get("bidflow", [])
+            ai_failures = rec.get("ai_failures", [])
             self.btn_replay.setEnabled(True)
             self._replay_index = idx
         self.list.clear()
@@ -201,6 +217,9 @@ class HistoryDialog(QDialog):
         if not moves:
             if not bidflow:
                 self.list.addItem("（无记录）")
+        failures_by_move = {}
+        for item in ai_failures:
+            failures_by_move.setdefault(item.get("move"), []).append(item)
         for n, (p, play) in enumerate(moves, 1):
             if play is None:
                 self.list.addItem(f"{n:>3}. {self.names[p]}　不出")
@@ -209,6 +228,11 @@ class HistoryDialog(QDialog):
                     f"{n:>3}. {self.names[p]}　"
                     f"{PLAY_TYPE_CN.get(play.play_type, play.play_type)}　"
                     f"{format_cards(play.cards)}")
+            for failure in failures_by_move.get(n, []):
+                self.list.addItem(
+                    f"     ⚠ AI 模型策略失败：{failure.get('reason', '未知原因')}；"
+                    f"困难策略接管：{failure.get('fallback', '—')}"
+                )
 
     def _replay(self):
         if self._replay_index < 0 or self._replay_index >= len(self.saved_games):

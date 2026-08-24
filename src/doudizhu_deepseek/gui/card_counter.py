@@ -20,6 +20,7 @@ class CardCounter(QFrame):
         super().__init__(parent)
         self.setObjectName("counter")
         self._cells = {}
+        self._last_counts = {}
         grid = QGridLayout(self)
         grid.setContentsMargins(8, 4, 8, 4)
         grid.setHorizontalSpacing(8)
@@ -29,8 +30,10 @@ class CardCounter(QFrame):
             cell.setSpacing(0)
             rl = QLabel(rank_name(r))
             rl.setAlignment(Qt.AlignCenter)
+            rl.setStyleSheet("color:#b8860b; font-size:12px; font-weight:bold;")
             cl = QLabel("4")
             cl.setAlignment(Qt.AlignCenter)
+            cl.setStyleSheet("color:#b8860b; font-size:16px; font-weight:bold;")
             cell.addWidget(rl)
             cell.addWidget(cl)
             frame = QFrame()
@@ -47,7 +50,8 @@ class CardCounter(QFrame):
         strong enough to read clearly on the dark-green panel from the start."""
         for r in range(3, 18):
             n = remaining.get(r, INITIAL.get(r, 0))
-            rl, cl = self._cells[r]
+            if self._last_counts.get(r) == n:
+                continue
+            _, cl = self._cells[r]
             cl.setText(str(n))
-            rl.setStyleSheet("color:#b8860b; font-size:12px; font-weight:bold;")
-            cl.setStyleSheet("color:#b8860b; font-size:16px; font-weight:bold;")
+            self._last_counts[r] = n

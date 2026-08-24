@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from doudizhu_deepseek.game import (Card, parse_play, Play, get_valid_plays,
-                                    DouDiZhuGame, _is_run, rank_name)
+                                    DouDiZhuGame, _is_run, rank_name, make_deck)
 from doudizhu_deepseek.ai import CardAI
 from doudizhu_deepseek import settings
 import doudizhu_deepseek.deepseek_ai as ds
@@ -155,8 +155,10 @@ def main():
     cfg = {"difficulty": "ai", "api_key": "sk-x"}
     with TemporaryDirectory() as cfg_dir, \
             patch.object(settings, "_config_dir", return_value=cfg_dir):
+        defaults = settings.load_config()
         settings.save_config(cfg)
         loaded = settings.load_config()
+    check("default difficulty is local hard", defaults["difficulty"] == "hard")
     check("settings roundtrip", loaded["difficulty"] == "ai")
     check("settings roundtrip key defaults", loaded["base_url"] == "http://192.168.76.43:8888/v1"
           and loaded["model"] == "deepseek-v4-flash" and loaded["api_key"] == "sk-x")
@@ -168,11 +170,13 @@ def main():
     g.current_player = 0
     offline = {"api_key": "", "base_url": "x", "model": "x"}
     try:
-        ds.ai_decide(g, g.hands[0], 0, offline, timeout=2)
+        ds.ai_decide_with_hard_fallback(
+            g, g.hands[0], 0, offline, CardAI("hard"), timeout=2
+        )
         no_fallback = False
     except ds.DeepSeekUnavailable:
         no_fallback = True
-    check("AI unavailable raises instead of local fallback", no_fallback)
+    check("AI connectivity failure still raises without fallback", no_fallback)
 
     class FakeResponse:
         def __init__(self, content):
@@ -187,11 +191,63 @@ def main():
     api_cfg = {"api_key": "sk-test", "base_url": "https://example.test/v1",
                "model": "test-model"}
     token = rank_name(g.hands[0][0].rank)
+    history_card = next(card for card in make_deck() if card not in g.hands[0])
+    model_history = [
+        (1, Play([history_card], "Single", history_card.rank)),
+        (2, None),
+    ]
     valid_response = FakeResponse('{"play": ["' + token + '"], "reason": "test"}')
-    with patch.object(ds.requests, "post", return_value=valid_response):
-        model_play = ds.ai_decide(g, g.hands[0], 0, api_cfg)
+    with patch.object(ds.requests, "post", return_value=valid_response) as post:
+        model_play = ds.ai_decide(
+            g, g.hands[0], 0, api_cfg, history=model_history
+        )
+    messages = post.call_args.kwargs["json"]["messages"]
+    snapshot = messages[1]["content"]
     check("AI valid response is accepted", model_play is not None and
           len(model_play.cards) == 1 and model_play.cards[0].rank == g.hands[0][0].rank)
+    check("AI receives fixed hard-rule system prompt",
+          "On a lead, play must be non-empty" in messages[0]["content"] and
+          "Trust only the current game snapshot" in messages[0]["content"])
+    check("AI receives complete current-game snapshot",
+          all(field in snapshot for field in (
+              "hand=", "public_bottom=", "cards_left=", "played=",
+              "unseen_in_opponents=", "history=", "FINAL REMINDER:"
+          )) and "P1:Single" in snapshot and "P2:pass" in snapshot and
+          snapshot.endswith("null is forbidden on a lead."))
+
+    wrapped_response = FakeResponse(
+        '<think>先分析牌局</think>\n```json\n'
+        '{"play": ["' + token + '"], "reason": "test"}\n```'
+    )
+    with patch.object(ds.requests, "post", return_value=wrapped_response):
+        wrapped_play = ds.ai_decide(g, g.hands[0], 0, api_cfg)
+    check("AI JSON in reasoning/Markdown wrapper is accepted",
+          wrapped_play is not None and wrapped_play.cards[0].rank == g.hands[0][0].rank)
+
+    text_parts_response = FakeResponse([
+        {"type": "text", "text": "出牌结果："},
+        {"type": "text", "text": '{"play": ["' + token + '"], "reason": "test"}'},
+    ])
+    with patch.object(ds.requests, "post", return_value=text_parts_response):
+        parts_play = ds.ai_decide(g, g.hands[0], 0, api_cfg)
+    check("AI structured text content is accepted",
+          parts_play is not None and parts_play.cards[0].rank == g.hands[0][0].rank)
+
+    plain_text_response = FakeResponse("我建议出最小的一张牌")
+    with patch.object(ds.requests, "post", return_value=plain_text_response):
+        try:
+            ds.ai_decide(g, g.hands[0], 0, api_cfg)
+            rejected_plain_text = False
+        except ds.DeepSeekUnavailable:
+            rejected_plain_text = True
+    check("AI response without JSON is rejected", rejected_plain_text)
+    with patch.object(ds.requests, "post", return_value=plain_text_response):
+        fallback_outcome = ds.ai_decide_with_hard_fallback(
+            g, g.hands[0], 0, api_cfg, CardAI("hard")
+        )
+    check("AI invalid response falls back to local hard strategy",
+          fallback_outcome.model_failure is not None and
+          fallback_outcome.play is not None)
 
     invalid_pass = FakeResponse('{"play": null, "reason": "test"}')
     with patch.object(ds.requests, "post", return_value=invalid_pass):

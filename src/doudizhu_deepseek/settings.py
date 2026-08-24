@@ -1,16 +1,18 @@
-"""Application settings persisted to a user-level INI file.
+"""Application settings persisted beside the project or executable.
 
 Stores the selected difficulty and DeepSeek API credentials.
-Config lives at `~/.doudizhu/config.ini` so it survives across runs and works
-with a PyInstaller single-file exe (no bundled files needed).
+During development the config lives at the repository root. A PyInstaller
+single-file build stores it beside the executable.
 """
 import configparser
 import os
+import sys
+from pathlib import Path
 
 APP_NAME = "doudizhu"
 
 _DEFAULT = {
-    "difficulty": "medium",        # easy / medium / hard / ai
+    "difficulty": "hard",          # easy / medium / hard / ai
     "api_key": "apikey",           # any OpenAI-compatible API key
     "base_url": "http://192.168.76.43:8888/v1",   # OpenAI-compatible endpoint
     "model": "deepseek-v4-flash",
@@ -19,9 +21,13 @@ _DEFAULT = {
 
 
 def _config_dir():
-    home = os.path.expanduser("~")
-    d = os.path.join(home, ".doudizhu")
-    return d
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    source = Path(__file__).resolve()
+    for parent in source.parents:
+        if (parent / "pyproject.toml").is_file():
+            return str(parent)
+    return os.getcwd()
 
 
 def config_path():

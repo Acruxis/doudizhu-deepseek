@@ -1,5 +1,6 @@
 """Main game window: layout, turn orchestration, and AI scheduling."""
 
+import copy
 import random
 from collections import Counter
 
@@ -12,7 +13,7 @@ from ..game import (DouDiZhuGame, GAME_IDLE, GAME_BIDDING, GAME_GRAB, GAME_PLAY,
                     PLAY_TYPE_CN, format_cards)
 from ..ai import CardAI
 from .. import settings
-from ..deepseek_ai import ai_decide
+from ..deepseek_ai import AIDecisionOutcome, ai_decide_with_hard_fallback
 from .card_widget import HandWidget
 from .card_counter import CardCounter, INITIAL
 from .settings_dialog import SettingsDialog
@@ -112,10 +113,12 @@ class MainWindow(QMainWindow):
         self.config = settings.load_config()
         self.game = DouDiZhuGame()
         self.ais = [CardAI("hard"), CardAI("hard"), CardAI("hard")]
-        self._diff = "medium"
+        self._diff = "hard"
         # per-player last action: tuple (kind, info) with info = Play | None
         self.recent = [("none", None), ("none", None), ("none", None)]
         self.history = []              # 出牌历史: list of (player_idx, Play | None)
+        self.ai_failures = []          # 模型策略失败及困难策略接管记录
+        self._ai_failure_count = 0
         self.bid_flow = []             # 叫分/抢地主流程: list of (player_idx, text)
         self.played_count = Counter()  # 全场已出的各点数张数（记牌器用）
         self.saved_games = []          # 已结束对局存档（不设上限）
@@ -128,6 +131,7 @@ class MainWindow(QMainWindow):
         self._auto_play = False        # 托管：把「你」交给最高难度人机
         self.auto_bot = CardAI("hard") # 托管使用的最高难度人机
         self._workers = set()          # 持有后台决策线程的引用，防止被 GC
+        self._decision_in_flight = False  # 同一回合只允许一个模型请求
         self._game_serial = 0          # 新对局自增，作废过期的异步结果
         # hint cycling state: rotate among candidate plays on repeated clicks
         self._hint_sig = None
@@ -165,9 +169,18 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet("font-size:15px; font-weight:bold; color:#fff;")
+        self.ai_failure_label = QLabel("")
+        self.ai_failure_label.setAlignment(Qt.AlignCenter)
+        self.ai_failure_label.setWordWrap(True)
+        self.ai_failure_label.setStyleSheet(
+            "font-size:12px; color:#ffd27f; background:rgba(90,45,0,90);"
+            "border-radius:6px; padding:4px;"
+        )
+        self.ai_failure_label.setVisible(False)
         center.addWidget(self.bottom_label)
         center.addWidget(self.trick_label)
         center.addWidget(self.status_label)
+        center.addWidget(self.ai_failure_label)
         center.addStretch(1)
         top.addWidget(self.left_panel)
         top.addLayout(center, 1)
@@ -276,7 +289,7 @@ class MainWindow(QMainWindow):
     # -- game lifecycle ------------------------------------------------------
 
     def _set_diff_and_ais(self):
-        diff = self.config.get("difficulty", "medium")
+        diff = self.config.get("difficulty", "hard")
         self._diff = diff
         local_diff = "hard" if diff == "ai" else diff
         self.ais[1] = CardAI(local_diff)
@@ -285,10 +298,15 @@ class MainWindow(QMainWindow):
 
     def new_game(self):
         self._game_serial += 1          # 作废任何仍在途的异步决策
+        self._decision_in_flight = False
         self.game.start_new_game()
         self._set_diff_and_ais()
         self.recent = [("none", None), ("none", None), ("none", None)]
         self.history = []
+        self.ai_failures = []
+        self._ai_failure_count = 0
+        self.ai_failure_label.clear()
+        self.ai_failure_label.setVisible(False)
         self.bid_flow = []
         self.played_count = Counter()
         self._ref_hands = [list(self.game.hands[i]) for i in range(3)]
@@ -493,25 +511,40 @@ class MainWindow(QMainWindow):
 
     def _ai_turn(self, g, p):
         """Use the model only for the standalone AI difficulty."""
-        hand = g.hands[p]
         if self._diff == "ai":
+            game_snapshot = copy.deepcopy(g)
+            hand = list(game_snapshot.hands[p])
+            history = list(self.history)
             return self._spawn_decision(
-                p, lambda: ai_decide(g, hand, p, self.config))
-        return self.ais[p].decide(g, hand, p)
+                p, lambda: ai_decide_with_hard_fallback(
+                    game_snapshot, hand, p, self.config, self.ais[p],
+                    history=history
+                )
+            )
+        return self.ais[p].decide(g, g.hands[p], p)
 
     def _auto_turn(self, g):
         """Decide for the human under 托管 — always the highest-difficulty bot
         or the model when the standalone AI difficulty is selected."""
         p = 0
-        hand = g.hands[0]
         if self._diff == "ai":
+            game_snapshot = copy.deepcopy(g)
+            hand = list(game_snapshot.hands[p])
+            history = list(self.history)
             return self._spawn_decision(
-                p, lambda: ai_decide(g, hand, p, self.config))
-        return self.auto_bot.decide(g, hand, 0)
+                p, lambda: ai_decide_with_hard_fallback(
+                    game_snapshot, hand, p, self.config, self.auto_bot,
+                    history=history
+                )
+            )
+        return self.auto_bot.decide(g, g.hands[0], 0)
 
     def _spawn_decision(self, p, fn):
         """Run `fn` in a worker thread; returns the _ASYNC sentinel. The result
         is applied later on the GUI thread by _async_done."""
+        if self._decision_in_flight:
+            return _ASYNC
+        self._decision_in_flight = True
         w = _MoveWorker(p, fn)
         serial = self._game_serial
         w.done.connect(
@@ -524,6 +557,7 @@ class MainWindow(QMainWindow):
     def _async_done(self, p, play, error, serial):
         if serial != self._game_serial:
             return                       # 已在后台决策期间开了新对局，丢弃
+        self._decision_in_flight = False
         if error:
             self._ai_timer.stop()
             self._update_status(f"AI 调用失败：{error}")
@@ -534,26 +568,42 @@ class MainWindow(QMainWindow):
                 "当前对局已暂停，不会改用本地人机策略。请检查设置后重试或开始新一局。",
             )
             return
-        self._apply_ai_result(p, play)
+        model_failure = None
+        if isinstance(play, AIDecisionOutcome):
+            model_failure = play.model_failure
+            play = play.play
+        self._apply_ai_result(p, play, model_failure)
 
-    def _apply_ai_result(self, p, play):
+    def _apply_ai_result(self, p, play, model_failure=None):
         """Execute a decided move (play or pass) for player `p` and advance."""
         g = self.game
         if play is None:
-            ok, _ = g.pass_turn(p)
+            ok, msg = g.pass_turn(p)
+            if not ok:
+                self._update_status(f"AI 决策无法执行：{msg}")
+                return
             self.recent[p] = ("pass", None)
             self._append_history(p, None)
-            self._update_status(f"{PLAYER_NAMES[p]} 不出")
+            status = f"{PLAYER_NAMES[p]} 不出"
         else:
-            ok, _ = g.play_cards(p, play.cards)
+            ok, msg = g.play_cards(p, play.cards)
             if ok:
                 self.recent[p] = ("play", play)
                 self._append_history(p, play)
                 self.played_count.update(c.rank for c in play.cards)
                 if play.play_type in (BOMB, ROCKET):
                     self._bomb_count += 1
-                self._update_status(
-                    f"{PLAYER_NAMES[p]} 出了【{PLAY_TYPE_CN.get(play.play_type, play.play_type)}】")
+                status = (
+                    f"{PLAYER_NAMES[p]} 出了【"
+                    f"{PLAY_TYPE_CN.get(play.play_type, play.play_type)}】"
+                )
+            else:
+                self._update_status(f"AI 决策无法执行：{msg}")
+                return
+        if model_failure:
+            self._record_ai_failure(p, model_failure)
+            status += f" · 模型策略失败，已由困难策略接管（本局 {self._ai_failure_count} 次）"
+        self._update_status(status)
         if g.phase == GAME_OVER:
             self._on_phase_change()
             return
@@ -664,13 +714,32 @@ class MainWindow(QMainWindow):
         """Record a play (or pass, play=None) by player `idx` for the history."""
         self.history.append((idx, play))
 
+    def _record_ai_failure(self, idx, reason):
+        """Persist one model failure after its hard-AI fallback move completed."""
+        self._ai_failure_count += 1
+        fallback = recent_text(self.recent[idx]).replace("\n", " ")
+        self.ai_failures.append({
+            "move": len(self.history),
+            "player": idx,
+            "reason": reason,
+            "fallback": fallback,
+        })
+        self.ai_failure_label.setText(
+            f"AI 模型策略失败：本局 {self._ai_failure_count} 次 · 最近 {PLAYER_NAMES[idx]}："
+            f"{reason}（困难策略：{fallback}）"
+        )
+        self.ai_failure_label.setVisible(True)
+
     def open_history(self):
         """Unified 回放 button: pick the in-progress game or one of the last 3
         archived finished games, then browse/replay any of them."""
         from ..game import GAME_PLAY
         current = self.history if self.game.phase == GAME_PLAY else []
-        HistoryDialog(PLAYER_NAMES, current, self.bid_flow, self.saved_games,
-                      self).exec_()
+        current_failures = self.ai_failures if current else []
+        HistoryDialog(
+            PLAYER_NAMES, current, self.bid_flow, current_failures,
+            self.saved_games, self
+        ).exec_()
 
     def _on_hand_edited(self):
         """Player manually changed the selection (click / drag / clear) ->
@@ -797,6 +866,7 @@ class MainWindow(QMainWindow):
             "landlord": g.landlord,
             "moves": list(self.history),
             "bidflow": list(self.bid_flow),   # 叫分/抢地主博弈也一并存档
+            "ai_failures": list(self.ai_failures),
         })
         if g.result:
             # 胜负结果直接在出牌区醒目显示，另附本局得分与累计分；
@@ -818,9 +888,21 @@ class MainWindow(QMainWindow):
     # -- settings ------------------------------------------------------------
 
     def open_settings(self):
-        dlg = SettingsDialog(self, self.config)
+        old_config = dict(self.config)
+        dlg = SettingsDialog(self, dict(self.config))
         if dlg.exec_():
             self.config = dlg.config
+            if self.config == old_config:
+                return
+            # Any in-flight result was created from the old difficulty/API
+            # config. Invalidate it immediately and let the current turn be
+            # scheduled once with the new settings.
+            self._game_serial += 1
+            self._decision_in_flight = False
+            self._ai_timer.stop()
             self._set_diff_and_ais()
-            self._refresh()
+            self.human_role_lbl.setText(
+                f"你 · 总分 {self.scores[0]}（难度: "
+                f"{DIFF_CN.get(self._diff, self._diff)}）"
+            )
             self._schedule_next()

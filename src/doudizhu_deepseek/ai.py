@@ -13,7 +13,7 @@ from .game import get_valid_plays, BOMB, ROCKET
 class CardAI:
     """A configurable AI player. `decide` returns a Play object or None for pass."""
 
-    def __init__(self, difficulty="medium", rng=None):
+    def __init__(self, difficulty="hard", rng=None):
         self.difficulty = difficulty
         self.rng = rng or random.Random()
 

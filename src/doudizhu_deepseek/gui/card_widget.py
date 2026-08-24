@@ -138,7 +138,6 @@ class HandWidget(QWidget):
         cur = sorted((c.rank, c.suit) for c in self.cards)
         new = sorted((c.rank, c.suit) for c in cards)
         if cur == new:
-            self._reflow()
             return
         for w in self.cards.values():
             w.deleteLater()
