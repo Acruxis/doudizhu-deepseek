@@ -1,0 +1,176 @@
+"""Quick correctness smoke test for the game engine, AI and GUI construction.
+
+Run:  python smoke_test.py
+Exits non-zero if anything fails.
+"""
+import random
+import sys
+
+from doudizhu.game import (Card, parse_play, Play, get_valid_plays,
+                           DouDiZhuGame, _is_run)
+from doudizhu.ai import CardAI
+from doudizhu import settings
+import doudizhu.deepseek_ai as ds
+
+
+def mk(ranks):
+    m = {"3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "10": 10,
+         "J": 11, "Q": 12, "K": 13, "A": 14, "2": 15, "小王": 16, "大王": 17}
+    out = []
+    for r in ranks:
+        rr = m.get(str(r), r)
+        out.append(Card(4 if rr >= 16 else 0, rr))
+    return out
+
+
+PASS = 0
+FAIL = 0
+
+
+def check(name, cond):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+    else:
+        FAIL += 1
+        print(f"  ✗ {name}")
+
+
+def expect_type(ranks, expected):
+    p = parse_play(mk(ranks))
+    check(f"{ranks} -> {expected}", p is not None and p.play_type == expected)
+
+
+def main():
+    # --- hand-type recognition ---
+    expect_type(["3"], "Single")
+    expect_type(["3", "3"], "Pair")
+    expect_type(["3", "3", "3"], "Triple")
+    expect_type(["3", "3", "3", "4"], "Triple1")
+    expect_type(["3", "3", "3", "4", "4"], "Triple2")
+    expect_type(["3", "4", "5", "6", "7"], "Straight")
+    expect_type(["10", "J", "Q", "K", "A"], "Straight")
+    expect_type(["3", "3", "4", "4", "5", "5"], "DoubleStraight")
+    expect_type(["3", "3", "3", "4", "4", "4"], "Plane")
+    expect_type(["3", "3", "3", "4", "4", "4", "5", "6"], "PlaneSingle")
+    expect_type(["3", "3", "3", "4", "4", "4", "5", "5", "6", "6"], "PlanePair")
+    expect_type(["3", "3", "3", "3"], "Bomb")
+    expect_type(["3", "3", "3", "3", "4", "5"], "Four2")
+    expect_type(["3", "3", "3", "3", "4", "4", "5", "5"], "Four2Pair")
+    expect_type(["小王", "大王"], "Rocket")
+    # illegal
+    check("3,3,4 illegal", parse_play(mk(["3", "3", "4"])) is None)
+    check("4,5,6 illegal", parse_play(mk(["4", "5", "6"])) is None)
+    check("3,3,3,4,5 illegal (=三带两单)", parse_play(mk(["3", "3", "3", "4", "5"])) is None)
+
+    # --- beats ---
+    s7 = Play([Card(0, 7)], "Single", 7)
+    s8 = Play([Card(0, 8)], "Single", 8)
+    bomb = Play([Card(0, 8)] * 4, "Bomb", 8)
+    rkt = Play([Card(4, 16), Card(4, 17)], "Rocket", 17)
+    check("s8 beats s7", s8.beats(s7))
+    check("bomb beats s7", bomb.beats(s7))
+    check("rkt beats bomb", rkt.beats(bomb))
+    check("bomb beats rkt == False", not bomb.beats(rkt))
+    # straights must have equal length to be comparable
+    st5 = parse_play(mk(["4", "5", "6", "7", "8"]))            # 5-long, v8
+    st7_lo = parse_play(mk(["3", "4", "5", "6", "7", "8", "9"]))  # 7-long, v9
+    st7_hi = parse_play(mk(["4", "5", "6", "7", "8", "9", "10"])) # 7-long, v10
+    check("longer straight cannot beat shorter (45678 vs 3456789)", not st5.beats(st7_lo))
+    check("shorter straight cannot beat longer (3456789 vs 45678)", not st7_lo.beats(st5))
+    check("same-length higher straight beats", st7_hi.beats(st7_lo))
+
+    # --- get_valid_plays ---
+    hand = mk(["3", "3", "4", "4", "5", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "2", "2"])
+    beats7 = get_valid_plays(hand, s7)
+    small = min(p.value for p in beats7 if p.play_type == "Single")
+    check("smallest single beating 7 is 8", small == 8)
+
+    # --- hard AI farmer cooperation ---
+    g = DouDiZhuGame()
+    g.start_new_game()
+    g.phase = "play"
+    g.landlord = 1                      # 0 and 2 are farmers
+    g.last_leader = 2                   # partner (farmer 2) holds the trick
+    g.current_player = 0
+    g.last_play = Play([Card(0, 7)], "Single", 7)
+    g.hands[2] = [Card(0, r) for r in range(3, 13)]        # 10 cards: not sprinting
+    hand0 = [Card(0, r) for r in range(9, 16)]             # singles 9..A,2
+    g.hands[0] = hand0
+    hard = CardAI("hard")
+    p = hard.decide(g, hand0, 0)
+    check("farmer covers non-sprinting partner (not blind pass)",
+          p is not None and p.play_type == "Single")
+    g.hands[2] = [Card(0, r) for r in range(3, 8)]         # 5 cards: sprinting
+    p2 = hard.decide(g, hand0, 0)
+    check("farmer lets sprinting partner run", p2 is None)
+
+    # --- full AI self-play, no deadlock / rule errors ---
+    def play_one(diff):
+        g = DouDiZhuGame()
+        g.start_new_game()
+        ais = [CardAI(diff), CardAI(diff), CardAI(diff)]
+        guard = 0
+        while g.phase == "bidding":
+            g.place_bid(g.current_player, ais[g.current_player].bid(g, g.current_player))
+            guard += 1
+            if guard > 10:
+                return "bid-loop"
+        while g.phase == "grab":
+            p = g.current_player
+            g.grab(p, ais[p].grab(g, p))
+            guard += 1
+            if guard > 10:
+                return "grab-loop"
+        if g.phase != "play":
+            return "redeal"
+        guard = 0
+        while g.phase == "play":
+            p = g.current_player
+            play = ais[p].decide(g, g.hands[p], p)
+            if play is None:
+                ok, _ = g.pass_turn(p)
+            else:
+                ok, _ = g.play_cards(p, play.cards)
+            if not ok:
+                return "rule-error"
+            guard += 1
+            if guard > 400:
+                return "deadlock"
+        return "ok"
+    random.seed(7)
+    results = {}
+    for diff in ("easy", "medium", "hard"):
+        rc = {}
+        for _ in range(40):
+            k = play_one(diff)
+            rc[k] = rc.get(k, 0) + 1
+        results[diff] = rc
+        check(f"self-play {diff} completes cleanly", rc.get("ok", 0) > 0 and
+              rc.get("deadlock", 0) == 0 and rc.get("rule-error", 0) == 0)
+
+    # --- settings roundtrip ---
+    cfg = {"difficulty": "hard", "api_key": "sk-x",
+           "ai_enabled": "true"}
+    settings.save_config(cfg)
+    loaded = settings.load_config()
+    check("settings roundtrip", loaded["difficulty"] == "hard")
+    check("settings roundtrip key defaults", loaded["base_url"] == "http://192.168.76.43:8888/v1"
+          and loaded["model"] == "deepseek-v4-flash" and loaded["api_key"] == "sk-x")
+
+    # --- LLM fallback (no network) ---
+    g = DouDiZhuGame()
+    g.start_new_game()
+    g.phase = "play"
+    ai = CardAI("hard")
+    offline = {"ai_enabled": "false", "api_key": "",
+               "base_url": "x", "model": "x"}
+    res = ds.hard_decide(g, g.hands[0], 0, offline, ai, timeout=2)
+    check("deepseek offline -> heuristic decision", res is not None)
+
+    print(f"\nPASS={PASS}  FAIL={FAIL}")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
