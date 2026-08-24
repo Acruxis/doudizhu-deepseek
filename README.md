@@ -17,6 +17,25 @@
 
 ## 运行（开发环境）
 
+### Linux（推荐使用 uv）
+
+项目要求 Python 3.10 或更高版本。先安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+进入项目目录后，同步 `uv.lock` 中锁定的依赖并启动游戏：
+
+```bash
+uv sync
+uv run python main.py
+```
+
+uv 会自动创建并管理项目虚拟环境 `.venv`，不需要手动激活。
+
+### 使用 pip
+
 ```bash
 pip install -r requirements.txt
 python main.py
@@ -67,7 +86,7 @@ doudizhu-deepseek/
 
 ## 技术栈
 
-- Python 3.8+
+- Python 3.10+
 - PyQt5 >= 5.15
 - requests（仅 DeepSeek 可选功能需要）
 - PyInstaller（Windows 打包）
