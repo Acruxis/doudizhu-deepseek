@@ -1,0 +1,20 @@
+[project]
+name = "doudizhu-deepseek"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "acruxis", email = "914928840@qq.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "pyqt5>=5.15",
+    "requests>=2.25",
+]
+
+[project.scripts]
+doudizhu-deepseek = "doudizhu_deepseek:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
